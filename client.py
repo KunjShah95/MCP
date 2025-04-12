@@ -1,98 +1,106 @@
-# pip install google-generativeai mcp python-dotenv
+# pip install google-adk google-generativeai mcp python-dotenv
 import asyncio
 import os
-# Add json import for formatting output
 import json
-from datetime import datetime
+# Either keep logging if we need it
+import logging
 from dotenv import load_dotenv
-from google import genai
 from google.genai import types
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+# Remove genai import if only used for configuration and that's been removed
+# import google.generativeai as genai
+from google.adk.agents.llm_agent import LlmAgent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Now access the environment variables after loading them
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-serp_api_key = os.getenv("SERP_API_KEY")
+# Enable debug logging (keep this if you want logging)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# Check if keys are available
-if not gemini_api_key:
-    print("Warning: GEMINI_API_KEY not found in .env file!")
-if not serp_api_key:
-    print("Warning: SERP_API_KEY not found in .env file!")
+# --- Step 1: Get tools from MCP server ---
+async def get_tools_async():
+    """Gets tools from the Flight Search MCP Server."""
+    print("Attempting to connect to MCP Flight Search server...")
+    server_params = StdioServerParameters(
+        command="mcp-flight-search",
+        args=["--connection_type", "stdio"],
+        env={"SERP_API_KEY": os.getenv("SERP_API_KEY")},
+    )
+    
+    tools, exit_stack = await MCPToolset.from_server(
+        connection_params=server_params
+    )
+    print("MCP Toolset created successfully.")
+    return tools, exit_stack
 
-client = genai.Client(api_key=gemini_api_key)
+# --- Step 2: Define ADK Agent Creation ---
+async def get_agent_async():
+    """Creates an ADK Agent equipped with tools from the MCP Server."""
+    tools, exit_stack = await get_tools_async()
+    print(f"Fetched {len(tools)} tools from MCP server.")
+    
+    # Create the LlmAgent matching the example structure
+    root_agent = LlmAgent(
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-pro-exp-03-25"),
+        name='flight_search_assistant',
+        instruction='Help user to search for flights using available tools based on prompt. If return date not specified, use an empty string for one-way trips.',
+        tools=tools,
+    )
+    
+    return root_agent, exit_stack
 
-# Re-add StdioServerParameters, setting args for stdio
-server_params = StdioServerParameters(
-    command="mcp-flight-search",
-    args=["--connection_type", "stdio"],
-    env={"SERP_API_KEY": serp_api_key},
-)
+# --- Step 3: Main Execution Logic ---
+async def async_main():
+    # Create services
+    session_service = InMemorySessionService()
 
-async def run():
-    # Remove debug prints
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            prompt = f"Find Flights from Atlanta to Las Vegas 2025-05-05"
-            await session.initialize()
-            # Remove debug prints
+    # Create a session
+    session = session_service.create_session(
+        state={}, app_name='flight_search_app', user_id='user_flights'
+    )
 
-            mcp_tools = await session.list_tools()
-            # Remove debug prints
-            tools = [
-                types.Tool(
-                    function_declarations=[
-                        {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": {
-                                k: v
-                                for k, v in tool.inputSchema.items()
-                                if k not in ["additionalProperties", "$schema"]
-                            },
-                        }
-                    ]
-                )
-                for tool in mcp_tools.tools
-            ]
-            # Remove debug prints
+    # Define the user prompt
+    query = "Find flights from Atlanta to Las Vegas 2025-05-05"
+    print(f"User Query: '{query}'")
+    
+    # Format input as types.Content
+    content = types.Content(role='user', parts=[types.Part(text=query)])
 
-            response = client.models.generate_content(
-                model="gemini-2.5-pro-exp-03-25",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    tools=tools,
-                ),
-            )
+    # Get agent and exit_stack
+    root_agent, exit_stack = await get_agent_async()
 
-            # Remove raw response print
-            if response.candidates[0].content.parts[0].function_call:
-                function_call = response.candidates[0].content.parts[0].function_call
+    # Create Runner
+    runner = Runner(
+        app_name='flight_search_app',
+        agent=root_agent,
+        session_service=session_service,
+    )
 
-                result = await session.call_tool(
-                    function_call.name, arguments=dict(function_call.args)
-                )
+    print("Running agent...")
+    events_async = runner.run_async(
+        session_id=session.id, 
+        user_id=session.user_id, 
+        new_message=content
+    )
 
-                # Parse and print formatted JSON result
-                print("--- Formatted Result ---") # Add header for clarity
-                try:
-                    flight_data = json.loads(result.content[0].text)
-                    print(json.dumps(flight_data, indent=2))
-                except json.JSONDecodeError:
-                    print("MCP server returned non-JSON response:")
-                    print(result.content[0].text)
-                except (IndexError, AttributeError):
-                     print("Unexpected result structure from MCP server:")
-                     print(result)
-            else:
-                print("No function call was generated by the model.")
-                if response.text:
-                     print("Model response:")
-                     print(response.text)
+    async for event in events_async:
+        print(f"Event received: {event}")
 
-# Revert main block
-asyncio.run(run())
+    
+    # Always clean up resources
+    print("Closing MCP server connection...")
+    await exit_stack.aclose()
+    print("Cleanup complete.")
+
+# --- Step 4: Run the Main Function ---
+if __name__ == "__main__":
+    # Ensure the API key is set
+    if not os.getenv("GOOGLE_API_KEY"):
+        raise ValueError("GOOGLE_API_KEY environment variable not set.")
+    if not os.getenv("SERP_API_KEY"):
+        raise ValueError("SERP_API_KEY environment variable not set.")
+    
+    # Run the main async function
+    asyncio.run(async_main())
